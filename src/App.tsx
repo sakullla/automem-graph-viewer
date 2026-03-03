@@ -1,10 +1,10 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
-import { Settings } from 'lucide-react'
+import { Keyboard, Settings } from 'lucide-react'
 
 // Build version - update this when making significant changes
 const BUILD_VERSION = '2024-12-23-obsidian-settings-v1'
 const HAND_CONTROLS_ENABLED = import.meta.env.VITE_ENABLE_HAND_CONTROLS === 'true'
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
+import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from 'react-resizable-panels'
 import { useGraphSnapshot } from './hooks/useGraphData'
 import { useAuth } from './hooks/useAuth'
 import { GraphCanvas } from './components/GraphCanvas'
@@ -23,6 +23,7 @@ import { RadialMenu } from './components/RadialMenu'
 import { LassoOverlay } from './components/LassoOverlay'
 import { SelectionActions } from './components/SelectionActions'
 import { TagCloud } from './components/TagCloud'
+import { KeyboardShortcutsHelp } from './components/KeyboardShortcutsHelp'
 import { useHandLockAndGrab } from './hooks/useHandLockAndGrab'
 import { useHandRecording, downloadRecording, listSavedRecordings, loadRecordingFromStorage } from './hooks/useHandRecording'
 import { useHandPlayback } from './hooks/useHandPlayback'
@@ -123,6 +124,9 @@ export default function App() {
   const [debugOverlayVisible, setDebugOverlayVisible] = useState(false)
   const [performanceMode, setPerformanceMode] = useState(false)
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false)
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const statusTimeoutRef = useRef<number | null>(null)
 
   // Focus/Spotlight mode state
   const [focusModeEnabled, setFocusModeEnabled] = useState(false)
@@ -156,12 +160,18 @@ export default function App() {
 
   // Tag cloud state
   const [tagCloudVisible, setTagCloudVisible] = useState(false)
+  const keyboardModifierLabel = useMemo(() => {
+    return navigator.platform.toLowerCase().includes('mac') ? 'Cmd' : 'Ctrl'
+  }, [])
 
   // Cleanup focus animation on unmount
   useEffect(() => {
     return () => {
       if (focusAnimationRef.current) {
         cancelAnimationFrame(focusAnimationRef.current)
+      }
+      if (statusTimeoutRef.current !== null) {
+        window.clearTimeout(statusTimeoutRef.current)
       }
     }
   }, [])
@@ -282,6 +292,17 @@ export default function App() {
   // Camera state and navigation for bookmarks
   const [cameraStateForBookmarks, setCameraStateForBookmarks] = useState({ x: 0, y: 0, z: 150, zoom: 1 })
   const navigateForBookmarksRef = useRef<((x: number, y: number, z?: number) => void) | null>(null)
+  const inspectorPanelRef = useRef<ImperativePanelHandle>(null)
+  const [isInspectorOpen, setIsInspectorOpen] = useState(false)
+
+  useEffect(() => {
+    if (selectedNode) {
+      inspectorPanelRef.current?.expand()
+      navigateForBookmarksRef.current?.(selectedNode.x ?? 0, selectedNode.y ?? 0, selectedNode.z ?? 0)
+    } else {
+      inspectorPanelRef.current?.collapse()
+    }
+  }, [selectedNode])
 
   const handleGestureStateChange = useCallback((state: GestureState) => {
     setGestureState(state)
@@ -347,6 +368,17 @@ export default function App() {
     return nodes.find(n => n.id === pathfinding.targetId) ?? null
   }, [pathfinding.targetId, nodes])
 
+  const showStatus = useCallback((message: string) => {
+    setStatusMessage(message)
+    if (statusTimeoutRef.current !== null) {
+      window.clearTimeout(statusTimeoutRef.current)
+    }
+    statusTimeoutRef.current = window.setTimeout(() => {
+      setStatusMessage(null)
+      statusTimeoutRef.current = null
+    }, 1800)
+  }, [])
+
   // Bookmark handlers (must be after data is defined)
   const handleSaveBookmark = useCallback(() => {
     addBookmark(
@@ -355,7 +387,8 @@ export default function App() {
       selectedNode?.id
     )
     sound.playBookmark()
-  }, [addBookmark, cameraStateForBookmarks, selectedNode, sound.playBookmark])
+    showStatus('Bookmark saved')
+  }, [addBookmark, cameraStateForBookmarks, selectedNode, sound.playBookmark, showStatus])
 
   const handleNavigateToBookmark = useCallback((bookmark: Bookmark) => {
     navigateForBookmarksRef.current?.(bookmark.position.x, bookmark.position.y)
@@ -366,7 +399,8 @@ export default function App() {
         setSelectedNode(node)
       }
     }
-  }, [nodes])
+    showStatus(`Jumped to ${bookmark.name}`)
+  }, [nodes, showStatus])
 
   const handleRenameBookmark = useCallback((id: string, name: string) => {
     updateBookmark(id, { name })
@@ -430,8 +464,8 @@ export default function App() {
   }, [])
 
   const handleCopyNodeId = useCallback((_nodeId: string) => {
-    // Could show a toast notification here
-  }, [])
+    showStatus('Node ID copied to clipboard')
+  }, [showStatus])
 
   const handleViewNodeContent = useCallback((node: GraphNode) => {
     // Select the node to show in inspector
@@ -605,12 +639,10 @@ export default function App() {
     onQuickNavigate: handleQuickNavigate,
     onStartPathfinding: handleStartPathfindingFromKeyboard,
     onCancelPathfinding: pathfinding.cancelPathSelection,
+    onShowHelp: () => setShortcutsHelpOpen(true),
     isPathSelecting: pathfinding.isSelectingTarget,
-    enabled: true,
+    enabled: !shortcutsHelpOpen,
   })
-
-  // Log available shortcuts for debugging (remove in production)
-  void shortcuts
 
   // Toggle tag cloud with 'T' key
   useEffect(() => {
@@ -632,7 +664,7 @@ export default function App() {
   return (
     <div className="h-screen w-screen bg-[#0a0a0f] text-slate-100 flex flex-col overflow-hidden">
       {/* Top Bar */}
-      <header className="h-14 flex-shrink-0 glass border-b border-white/5 flex items-center px-4 gap-4 z-50">
+      <header className="h-14 flex-shrink-0 glass border-b border-white/5 flex items-center px-4 gap-4 z-50 overflow-x-auto overflow-y-hidden">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
             <span className="text-white font-bold text-sm">AM</span>
@@ -645,7 +677,8 @@ export default function App() {
         <SearchBar
           value={searchTerm}
           onChange={handleSearch}
-          className="flex-1 max-w-xl"
+          className="flex-1 max-w-xl min-w-[220px]"
+          shortcutsEnabled={!shortcutsHelpOpen}
         />
 
         <StatsBar stats={data?.stats} isLoading={isLoading} />
@@ -767,6 +800,16 @@ export default function App() {
             <span className="text-yellow-400 text-sm font-medium">TEST MODE</span>
           </div>
         )}
+
+        <button
+          onClick={() => setShortcutsHelpOpen(true)}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white transition-all duration-200"
+          title="Keyboard shortcuts (?)"
+          aria-label="Open keyboard shortcuts help"
+        >
+          <Keyboard className="w-5 h-5" />
+          <span className="text-sm font-medium hidden xl:inline">Shortcuts</span>
+        </button>
 
         {/* Settings Panel Toggle */}
         <button
@@ -890,6 +933,7 @@ export default function App() {
                 onDelete={deleteBookmark}
                 onRename={handleRenameBookmark}
                 onSaveBookmark={handleSaveBookmark}
+                modifierLabel={keyboardModifierLabel}
                 visible={true}
               />
 
@@ -950,11 +994,21 @@ export default function App() {
           </Panel>
 
           {/* Resize Handle */}
-          <PanelResizeHandle className="w-1 bg-white/5 hover:bg-blue-500/50 transition-colors cursor-col-resize" />
+          <PanelResizeHandle className={`w-1 bg-white/5 hover:bg-blue-500/50 transition-colors cursor-col-resize ${!isInspectorOpen ? 'opacity-0 pointer-events-none' : ''}`} />
 
           {/* Inspector Panel */}
-          <Panel defaultSize={25} minSize={15} maxSize={40}>
+          <Panel
+            ref={inspectorPanelRef}
+            collapsible
+            collapsedSize={0}
+            defaultSize={0}
+            minSize={15}
+            maxSize={40}
+            onExpand={() => setIsInspectorOpen(true)}
+            onCollapse={() => setIsInspectorOpen(false)}
+          >
             <Inspector
+              key={selectedNode?.id ?? 'none'}
               node={selectedNode}
               onClose={() => setSelectedNode(null)}
               onNavigate={handleInspectorNavigate}
@@ -1019,6 +1073,24 @@ export default function App() {
         visible={tagCloudVisible}
         onClose={() => setTagCloudVisible(false)}
       />
+
+      <KeyboardShortcutsHelp
+        open={shortcutsHelpOpen}
+        onClose={() => setShortcutsHelpOpen(false)}
+        shortcuts={shortcuts}
+        modifierLabel={keyboardModifierLabel}
+      />
+
+      {statusMessage && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="fixed bottom-5 right-5 z-[95] rounded-lg border border-blue-400/20 bg-slate-900/95 px-3 py-2 text-sm text-slate-100 shadow-xl"
+        >
+          {statusMessage}
+        </div>
+      )}
     </div>
   )
 }
