@@ -1,10 +1,8 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react'
-import { Settings } from 'lucide-react'
+import { Keyboard, Settings } from 'lucide-react'
 
-// Build version - update this when making significant changes
-const BUILD_VERSION = '2024-12-23-obsidian-settings-v1'
 const HAND_CONTROLS_ENABLED = import.meta.env.VITE_ENABLE_HAND_CONTROLS === 'true'
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
+import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from 'react-resizable-panels'
 import { useGraphSnapshot } from './hooks/useGraphData'
 import { useAuth } from './hooks/useAuth'
 import { GraphCanvas } from './components/GraphCanvas'
@@ -12,6 +10,7 @@ import { Inspector } from './components/Inspector'
 import { SearchBar } from './components/SearchBar'
 import { TokenPrompt } from './components/TokenPrompt'
 import { StatsBar } from './components/StatsBar'
+import { Breadcrumbs } from './components/Breadcrumbs'
 import { GestureDebugOverlay } from './components/GestureDebugOverlay'
 import { Hand2DOverlay } from './components/Hand2DOverlay'
 import { HandControlOverlay } from './components/HandControlOverlay'
@@ -23,10 +22,13 @@ import { RadialMenu } from './components/RadialMenu'
 import { LassoOverlay } from './components/LassoOverlay'
 import { SelectionActions } from './components/SelectionActions'
 import { TagCloud } from './components/TagCloud'
+import { KeyboardShortcutsHelp } from './components/KeyboardShortcutsHelp'
 import { useHandLockAndGrab } from './hooks/useHandLockAndGrab'
 import { useHandRecording, downloadRecording, listSavedRecordings, loadRecordingFromStorage } from './hooks/useHandRecording'
 import { useHandPlayback } from './hooks/useHandPlayback'
 import { useTagCloud } from './hooks/useTagCloud'
+import { useFilterChips } from './hooks/useFilterChips'
+import { useBreadcrumbs } from './hooks/useBreadcrumbs'
 import { useKeyboardNavigation } from './hooks/useKeyboardNavigation'
 import { useBookmarks, type Bookmark } from './hooks/useBookmarks'
 import { usePathfinding } from './hooks/usePathfinding'
@@ -34,6 +36,7 @@ import { useTimeTravel } from './hooks/useTimeTravel'
 import { useSoundEffects } from './hooks/useSoundEffects'
 import type {
   GraphNode,
+  RelationType,
   FilterState,
   ForceConfig,
   DisplayConfig,
@@ -110,7 +113,13 @@ function BoltIcon({ className }: { className?: string }) {
   )
 }
 
-// Stable empty arrays to prevent creating new references on every render
+const CLUSTER_MODE_LABELS: Record<string, string> = {
+  none: 'Clustering off',
+  type: 'Clustering by type',
+  tags: 'Clustering by tags',
+  semantic: 'Clustering by semantic similarity',
+}
+
 const EMPTY_NODES: GraphNode[] = []
 const EMPTY_EDGES: import('./lib/types').GraphEdge[] = []
 
@@ -123,12 +132,9 @@ export default function App() {
   const [debugOverlayVisible, setDebugOverlayVisible] = useState(false)
   const [performanceMode, setPerformanceMode] = useState(false)
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false)
-
-  // Focus/Spotlight mode state
-  const [focusModeEnabled, setFocusModeEnabled] = useState(false)
-  const [focusTransition, setFocusTransition] = useState(0) // 0-1 for smooth transition
-  const focusTransitionRef = useRef<number>(0)
-  const focusAnimationRef = useRef<number | null>(null)
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false)
+  const [statusMessage, setStatusMessage] = useState<string | null>(null)
+  const statusTimeoutRef = useRef<number | null>(null)
 
   // Radial menu state
   const [radialMenuState, setRadialMenuState] = useState<{
@@ -156,12 +162,14 @@ export default function App() {
 
   // Tag cloud state
   const [tagCloudVisible, setTagCloudVisible] = useState(false)
+  const keyboardModifierLabel = useMemo(() => {
+    return navigator.platform.toLowerCase().includes('mac') ? 'Cmd' : 'Ctrl'
+  }, [])
 
-  // Cleanup focus animation on unmount
   useEffect(() => {
     return () => {
-      if (focusAnimationRef.current) {
-        cancelAnimationFrame(focusAnimationRef.current)
+      if (statusTimeoutRef.current !== null) {
+        window.clearTimeout(statusTimeoutRef.current)
       }
     }
   }, [])
@@ -212,8 +220,6 @@ export default function App() {
         getGestureState: () => gestureState,
       }
       ;(window as unknown as Record<string, unknown>).__handTest = api
-      console.log('[TEST MODE] Enabled. Use window.__handTest for automation')
-      console.log('[TEST MODE] Commands: startRecording(), stopRecording(), listRecordings(), loadFromStorage(key), play(), pause()')
     }
   }, [isTestMode, recording, playback, gestureState])
 
@@ -283,7 +289,18 @@ export default function App() {
 
   // Camera state and navigation for bookmarks
   const [cameraStateForBookmarks, setCameraStateForBookmarks] = useState({ x: 0, y: 0, z: 150, zoom: 1 })
-  const navigateForBookmarksRef = useRef<((x: number, y: number) => void) | null>(null)
+  const navigateForBookmarksRef = useRef<((x: number, y: number, z?: number) => void) | null>(null)
+  const inspectorPanelRef = useRef<ImperativePanelHandle>(null)
+  const [isInspectorOpen, setIsInspectorOpen] = useState(false)
+
+  useEffect(() => {
+    if (selectedNode) {
+      inspectorPanelRef.current?.expand()
+      navigateForBookmarksRef.current?.(selectedNode.x ?? 0, selectedNode.y ?? 0, selectedNode.z ?? 0)
+    } else {
+      inspectorPanelRef.current?.collapse()
+    }
+  }, [selectedNode])
 
   const handleGestureStateChange = useCallback((state: GestureState) => {
     setGestureState(state)
@@ -311,6 +328,59 @@ export default function App() {
     nodes,
     typeColors: data?.meta?.type_colors,
   })
+
+  // Breadcrumbs (node selection history)
+  const breadcrumbs = useBreadcrumbs()
+
+  // Tag color map for filter chips (tag → color from dominant type)
+  const tagColorMap = useMemo(() => {
+    const map = new Map<string, string>()
+    const typeColors = data?.meta?.type_colors
+    if (!typeColors) return map
+    for (const tagData of tagCloud.tags) {
+      map.set(tagData.tag, typeColors[tagData.dominantType] ?? '#94A3B8')
+    }
+    return map
+  }, [tagCloud.tags, data?.meta?.type_colors])
+
+  // Filter chip callbacks (extracted to top level per Rules of Hooks)
+  const { deselectTag, clearSelection } = tagCloud
+  const handleClearSearch = useCallback(() => setSearchTerm(''), [])
+  const handleClearAllFilters = useCallback(() => {
+    clearSelection()
+    setSearchTerm('')
+  }, [clearSelection])
+
+  // Filter chips (derived from search + tags)
+  const filterChips = useFilterChips({
+    searchTerm,
+    selectedTags: tagCloud.selectedTags,
+    tagColorMap,
+    onDeselectTag: deselectTag,
+    onClearSearch: handleClearSearch,
+    onClearAll: handleClearAllFilters,
+  })
+
+  // Client-visible node count (intersection of tag filter + search filter)
+  const clientVisibleNodeCount = useMemo(() => {
+    if (!filterChips.hasActiveFilters) return nodes.length
+    let filtered = nodes
+    // Apply tag filter
+    if (tagCloud.hasActiveFilter) {
+      filtered = filtered.filter((n) => tagCloud.filteredNodeIds.has(n.id))
+    }
+    // Apply search filter
+    if (searchTerm.trim()) {
+      const lower = searchTerm.toLowerCase()
+      filtered = filtered.filter(
+        (n) =>
+          n.content.toLowerCase().includes(lower) ||
+          n.type.toLowerCase().includes(lower) ||
+          n.tags.some((t) => t.toLowerCase().includes(lower))
+      )
+    }
+    return filtered.length
+  }, [nodes, tagCloud.hasActiveFilter, tagCloud.filteredNodeIds, searchTerm, filterChips.hasActiveFilters])
 
   // Sound Effects
   const sound = useSoundEffects()
@@ -349,6 +419,17 @@ export default function App() {
     return nodes.find(n => n.id === pathfinding.targetId) ?? null
   }, [pathfinding.targetId, nodes])
 
+  const showStatus = useCallback((message: string) => {
+    setStatusMessage(message)
+    if (statusTimeoutRef.current !== null) {
+      window.clearTimeout(statusTimeoutRef.current)
+    }
+    statusTimeoutRef.current = window.setTimeout(() => {
+      setStatusMessage(null)
+      statusTimeoutRef.current = null
+    }, 1800)
+  }, [])
+
   // Bookmark handlers (must be after data is defined)
   const handleSaveBookmark = useCallback(() => {
     addBookmark(
@@ -357,7 +438,8 @@ export default function App() {
       selectedNode?.id
     )
     sound.playBookmark()
-  }, [addBookmark, cameraStateForBookmarks, selectedNode, sound.playBookmark])
+    showStatus('Bookmark saved')
+  }, [addBookmark, cameraStateForBookmarks, selectedNode, sound.playBookmark, showStatus])
 
   const handleNavigateToBookmark = useCallback((bookmark: Bookmark) => {
     navigateForBookmarksRef.current?.(bookmark.position.x, bookmark.position.y)
@@ -368,7 +450,8 @@ export default function App() {
         setSelectedNode(node)
       }
     }
-  }, [nodes])
+    showStatus(`Jumped to ${bookmark.name}`)
+  }, [nodes, showStatus])
 
   const handleRenameBookmark = useCallback((id: string, name: string) => {
     updateBookmark(id, { name })
@@ -382,6 +465,7 @@ export default function App() {
     }
   }, [getBookmarkByIndex, handleNavigateToBookmark])
 
+  const { push: breadcrumbPush } = breadcrumbs
   const handleNodeSelect = useCallback((node: GraphNode | null) => {
     // If we're in path selection mode and a node is clicked, complete the path
     if (pathfinding.isSelectingTarget && node) {
@@ -391,9 +475,22 @@ export default function App() {
     }
     if (node) {
       sound.playSelect(node.importance ?? 0.5)
+      breadcrumbPush(node)
     }
     setSelectedNode(node)
-  }, [pathfinding.isSelectingTarget, pathfinding.completePathSelection, sound.playPathFound, sound.playSelect])
+  }, [pathfinding.isSelectingTarget, pathfinding.completePathSelection, sound.playPathFound, sound.playSelect, breadcrumbPush])
+
+  const handleInspectorNavigate = useCallback((node: GraphNode | null) => {
+    if (!node) return
+
+    // Preserve path-selection behavior handled in handleNodeSelect.
+    handleNodeSelect(node)
+
+    // Keep camera navigation for normal inspector navigation.
+    if (!pathfinding.isSelectingTarget) {
+      navigateForBookmarksRef.current?.(node.x ?? 0, node.y ?? 0, node.z ?? 0)
+    }
+  }, [handleNodeSelect, pathfinding.isSelectingTarget])
 
   const handleNodeHover = useCallback((node: GraphNode | null) => {
     if (node) {
@@ -419,10 +516,9 @@ export default function App() {
     }))
   }, [])
 
-  const handleCopyNodeId = useCallback((nodeId: string) => {
-    // Could show a toast notification here
-    console.log('Copied node ID:', nodeId)
-  }, [])
+  const handleCopyNodeId = useCallback((_nodeId: string) => {
+    showStatus('Node ID copied to clipboard')
+  }, [showStatus])
 
   const handleViewNodeContent = useCallback((node: GraphNode) => {
     // Select the node to show in inspector
@@ -507,6 +603,20 @@ export default function App() {
     setSearchTerm(term)
   }, [sound.playSearch])
 
+  // Inspector tag click: add tag filter + close inspector + reheat
+  const { selectTag } = tagCloud
+  const handleInspectorTagClick = useCallback((tag: string) => {
+    selectTag(tag)
+    setSelectedNode(null) // auto-close inspector to show filtered graph
+    reheatFn?.()
+    showStatus(`Filter: ${tag}`)
+  }, [selectTag, reheatFn, showStatus])
+
+  // Inspector relationship type toggle
+  const handleRelationshipTypeClick = useCallback((type: RelationType) => {
+    setRelationshipVisibility((prev) => ({ ...prev, [type]: !prev[type] }))
+  }, [])
+
   const handleFilterChange = useCallback((newFilters: Partial<FilterState>) => {
     setFilters(prev => ({ ...prev, ...newFilters }))
   }, [])
@@ -519,9 +629,15 @@ export default function App() {
     setDisplayConfig(prev => ({ ...prev, ...config }))
   }, [])
 
+  const prevClusterModeRef = useRef<ClusterConfig['mode']>(DEFAULT_CLUSTER_CONFIG.mode)
+
   const handleClusterConfigChange = useCallback((config: Partial<ClusterConfig>) => {
     setClusterConfig(prev => ({ ...prev, ...config }))
-  }, [])
+    if (config.mode && config.mode !== prevClusterModeRef.current) {
+      prevClusterModeRef.current = config.mode
+      showStatus(CLUSTER_MODE_LABELS[config.mode] || `Cluster mode: ${config.mode}`)
+    }
+  }, [showStatus])
 
   const handleRelationshipVisibilityChange = useCallback((visibility: Partial<RelationshipVisibility>) => {
     setRelationshipVisibility(prev => ({ ...prev, ...visibility }))
@@ -539,44 +655,6 @@ export default function App() {
     setDisplayConfig(prev => ({ ...prev, showLabels: !prev.showLabels }))
   }, [])
 
-  // Focus mode toggle with smooth transition animation
-  const handleToggleFocusMode = useCallback(() => {
-    setFocusModeEnabled(prev => {
-      const newEnabled = !prev
-
-      // Cancel any existing animation
-      if (focusAnimationRef.current) {
-        cancelAnimationFrame(focusAnimationRef.current)
-      }
-
-      const startTime = performance.now()
-      const duration = 400 // 400ms transition
-      const startValue = focusTransitionRef.current
-      const endValue = newEnabled ? 1 : 0
-
-      const animate = (currentTime: number) => {
-        const elapsed = currentTime - startTime
-        const progress = Math.min(elapsed / duration, 1)
-
-        // Ease out cubic for smooth deceleration
-        const eased = 1 - Math.pow(1 - progress, 3)
-        const newTransition = startValue + (endValue - startValue) * eased
-
-        focusTransitionRef.current = newTransition
-        setFocusTransition(newTransition)
-
-        if (progress < 1) {
-          focusAnimationRef.current = requestAnimationFrame(animate)
-        } else {
-          focusAnimationRef.current = null
-        }
-      }
-
-      focusAnimationRef.current = requestAnimationFrame(animate)
-      return newEnabled
-    })
-  }, [])
-
   // Keyboard navigation
   const handleStartPathfindingFromKeyboard = useCallback(() => {
     if (selectedNode) {
@@ -591,17 +669,14 @@ export default function App() {
     onReheat: handleReheat,
     onToggleSettings: () => setSettingsPanelOpen(prev => !prev),
     onToggleLabels: handleToggleLabels,
-    onToggleFocus: handleToggleFocusMode,
     onSaveBookmark: handleSaveBookmark,
     onQuickNavigate: handleQuickNavigate,
     onStartPathfinding: handleStartPathfindingFromKeyboard,
     onCancelPathfinding: pathfinding.cancelPathSelection,
+    onShowHelp: () => setShortcutsHelpOpen(true),
     isPathSelecting: pathfinding.isSelectingTarget,
-    enabled: true,
+    enabled: !shortcutsHelpOpen,
   })
-
-  // Log available shortcuts for debugging (remove in production)
-  void shortcuts
 
   // Toggle tag cloud with 'T' key
   useEffect(() => {
@@ -616,6 +691,54 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [])
 
+  // Shared breadcrumb navigation callback (used by keyboard + Breadcrumbs component)
+  const nodesRef = useRef(nodes)
+  nodesRef.current = nodes
+
+  const breadcrumbNavigate = useCallback((node: GraphNode) => {
+    setSelectedNode(node)
+    navigateForBookmarksRef.current?.(node.x ?? 0, node.y ?? 0, node.z ?? 0)
+  }, [])
+
+  const handleBreadcrumbBack = useCallback(() => {
+    breadcrumbs.goBack(nodesRef.current, breadcrumbNavigate)
+  }, [breadcrumbs.goBack, breadcrumbNavigate])
+
+  const handleBreadcrumbForward = useCallback(() => {
+    breadcrumbs.goForward(nodesRef.current, breadcrumbNavigate)
+  }, [breadcrumbs.goForward, breadcrumbNavigate])
+
+  const handleBreadcrumbJumpTo = useCallback((index: number) => {
+    breadcrumbs.jumpTo(index, nodesRef.current, breadcrumbNavigate)
+  }, [breadcrumbs.jumpTo, breadcrumbNavigate])
+
+  // Breadcrumb keyboard shortcuts: Cmd+[ back, Cmd+] forward
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (!(e.metaKey || e.ctrlKey)) return
+
+      if (e.key === '[') {
+        e.preventDefault()
+        handleBreadcrumbBack()
+      } else if (e.key === ']') {
+        e.preventDefault()
+        handleBreadcrumbForward()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [handleBreadcrumbBack, handleBreadcrumbForward])
+
+  // Filter-triggered reheat: when tag filter activates/deactivates, reheat physics
+  const prevHasTagFilter = useRef(tagCloud.hasActiveFilter)
+  useEffect(() => {
+    if (tagCloud.hasActiveFilter !== prevHasTagFilter.current) {
+      prevHasTagFilter.current = tagCloud.hasActiveFilter
+      reheatFn?.()
+    }
+  }, [tagCloud.hasActiveFilter, reheatFn])
+
   if (!isAuthenticated) {
     return <TokenPrompt onSubmit={setToken} />
   }
@@ -623,7 +746,7 @@ export default function App() {
   return (
     <div className="h-screen w-screen bg-[#0a0a0f] text-slate-100 flex flex-col overflow-hidden">
       {/* Top Bar */}
-      <header className="h-14 flex-shrink-0 glass border-b border-white/5 flex items-center px-4 gap-4 z-50">
+      <header className="h-14 flex-shrink-0 glass border-b border-white/5 flex items-center px-4 gap-4 z-50 overflow-x-auto overflow-y-hidden">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
             <span className="text-white font-bold text-sm">AM</span>
@@ -636,43 +759,21 @@ export default function App() {
         <SearchBar
           value={searchTerm}
           onChange={handleSearch}
-          className="flex-1 max-w-xl"
+          className="flex-1 max-w-xl min-w-[220px]"
+          shortcutsEnabled={!shortcutsHelpOpen}
+          chips={filterChips.chips}
+          onRemoveChip={filterChips.removeChip}
+          onClearAll={filterChips.clearAll}
+          matchingCount={clientVisibleNodeCount}
+          totalCount={nodes.length}
         />
 
-        <StatsBar stats={data?.stats} isLoading={isLoading} />
-
-        {/* Version indicator - helps verify deployment */}
-        <span className="text-xs text-slate-500 hidden lg:inline" title="Build version">
-          {BUILD_VERSION}
-        </span>
-
-        {/* Focus/Spotlight Mode Toggle */}
-        <button
-          onClick={handleToggleFocusMode}
-          className={`
-            flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all duration-200
-            ${focusModeEnabled
-              ? 'bg-gradient-to-r from-amber-500 to-yellow-500 text-white shadow-lg shadow-amber-500/25'
-              : 'bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white'
-            }
-          `}
-          title={focusModeEnabled ? 'Disable focus mode (F)' : 'Enable focus mode - spotlight selected node (F)'}
-        >
-          <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <circle cx="12" cy="12" r="3" />
-            <path d="M12 2v2" />
-            <path d="M12 20v2" />
-            <path d="M2 12h2" />
-            <path d="M20 12h2" />
-            <path d="m4.93 4.93 1.41 1.41" />
-            <path d="m17.66 17.66 1.41 1.41" />
-            <path d="m17.66 6.34 1.41-1.41" />
-            <path d="m4.93 19.07 1.41-1.41" />
-          </svg>
-          <span className="text-sm font-medium hidden sm:inline">
-            {focusModeEnabled ? 'Focus' : 'Focus'}
-          </span>
-        </button>
+        <StatsBar
+          stats={data?.stats}
+          isLoading={isLoading}
+          clientVisibleCount={clientVisibleNodeCount}
+          hasClientFilter={filterChips.hasActiveFilters}
+        />
 
         {/* Performance Mode Toggle */}
         <button
@@ -759,6 +860,16 @@ export default function App() {
           </div>
         )}
 
+        <button
+          onClick={() => setShortcutsHelpOpen(true)}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 hover:text-white transition-all duration-200"
+          title="Keyboard shortcuts (?)"
+          aria-label="Open keyboard shortcuts help"
+        >
+          <Keyboard className="w-5 h-5" />
+          <span className="text-sm font-medium hidden xl:inline">Shortcuts</span>
+        </button>
+
         {/* Settings Panel Toggle */}
         <button
           onClick={() => setSettingsPanelOpen(!settingsPanelOpen)}
@@ -778,11 +889,23 @@ export default function App() {
         </button>
       </header>
 
+      {/* Breadcrumbs (node selection history) */}
+      <Breadcrumbs
+        history={breadcrumbs.history}
+        currentIndex={breadcrumbs.currentIndex}
+        nodes={nodes}
+        canGoBack={breadcrumbs.canGoBack}
+        canGoForward={breadcrumbs.canGoForward}
+        onGoBack={handleBreadcrumbBack}
+        onGoForward={handleBreadcrumbForward}
+        onJumpTo={handleBreadcrumbJumpTo}
+      />
+
       {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
         <PanelGroup direction="horizontal" className="flex-1">
           {/* Graph Canvas */}
-          <Panel defaultSize={settingsPanelOpen ? 50 : 75} minSize={40}>
+          <Panel defaultSize={75} minSize={40}>
             <div ref={canvasContainerRef} className="h-full relative">
               {isLoading && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
@@ -829,8 +952,6 @@ export default function App() {
                 typeColors={data?.meta?.type_colors}
                 onReheatReady={setReheatFn}
                 onResetViewReady={setResetViewFn}
-                focusModeEnabled={focusModeEnabled}
-                focusTransition={focusTransition}
                 onCameraStateForBookmarks={setCameraStateForBookmarks}
                 onNavigateForBookmarks={(fn) => { navigateForBookmarksRef.current = fn }}
                 pathNodeIds={pathfinding.pathNodeIds}
@@ -881,6 +1002,7 @@ export default function App() {
                 onDelete={deleteBookmark}
                 onRename={handleRenameBookmark}
                 onSaveBookmark={handleSaveBookmark}
+                modifierLabel={keyboardModifierLabel}
                 visible={true}
               />
 
@@ -941,16 +1063,29 @@ export default function App() {
           </Panel>
 
           {/* Resize Handle */}
-          <PanelResizeHandle className="w-1 bg-white/5 hover:bg-blue-500/50 transition-colors cursor-col-resize" />
+          <PanelResizeHandle className={`w-1 bg-white/5 hover:bg-blue-500/50 transition-colors cursor-col-resize ${!isInspectorOpen ? 'opacity-0 pointer-events-none' : ''}`} />
 
           {/* Inspector Panel */}
-          <Panel defaultSize={25} minSize={15} maxSize={40}>
+          <Panel
+            ref={inspectorPanelRef}
+            collapsible
+            collapsedSize={0}
+            defaultSize={25}
+            minSize={15}
+            maxSize={40}
+            onExpand={() => setIsInspectorOpen(true)}
+            onCollapse={() => setIsInspectorOpen(false)}
+          >
             <Inspector
+              key={selectedNode?.id ?? 'none'}
               node={selectedNode}
               onClose={() => setSelectedNode(null)}
-              onNavigate={handleNodeSelect}
+              onNavigate={handleInspectorNavigate}
               onStartPathfinding={pathfinding.startPathSelection}
               isPathSelecting={pathfinding.isSelectingTarget}
+              onTagClick={handleInspectorTagClick}
+              onRelationshipTypeClick={handleRelationshipTypeClick}
+              relationshipVisibility={relationshipVisibility}
             />
           </Panel>
         </PanelGroup>
@@ -985,11 +1120,9 @@ export default function App() {
           node={radialMenuState.node}
           position={radialMenuState.position}
           onClose={handleCloseRadialMenu}
-          onToggleFocus={handleToggleFocusMode}
           onStartPath={pathfinding.startPathSelection}
           onViewContent={handleViewNodeContent}
           onCopyId={handleCopyNodeId}
-          focusModeEnabled={focusModeEnabled}
         />
       )}
 
@@ -1010,6 +1143,24 @@ export default function App() {
         visible={tagCloudVisible}
         onClose={() => setTagCloudVisible(false)}
       />
+
+      <KeyboardShortcutsHelp
+        open={shortcutsHelpOpen}
+        onClose={() => setShortcutsHelpOpen(false)}
+        shortcuts={shortcuts}
+        modifierLabel={keyboardModifierLabel}
+      />
+
+      {statusMessage && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="fixed bottom-5 right-5 z-[95] rounded-lg border border-blue-400/20 bg-slate-900/95 px-3 py-2 text-sm text-slate-100 shadow-xl"
+        >
+          {statusMessage}
+        </div>
+      )}
     </div>
   )
 }

@@ -12,7 +12,6 @@
 import { useEffect, useCallback, useState } from 'react'
 import {
   Search,
-  Sun,
   Route,
   Plus,
   Pencil,
@@ -29,7 +28,6 @@ interface RadialMenuItem {
   label: string
   color: string
   action: () => void
-  disabled?: boolean
 }
 
 interface RadialMenuProps {
@@ -37,14 +35,12 @@ interface RadialMenuProps {
   position: { x: number; y: number }
   onClose: () => void
   onFindSimilar?: (node: GraphNode) => void
-  onToggleFocus?: () => void
   onStartPath?: (nodeId: string) => void
   onAddToSelection?: (node: GraphNode) => void
   onEdit?: (node: GraphNode) => void
   onViewContent?: (node: GraphNode) => void
   onCopyId?: (nodeId: string) => void
   onDelete?: (node: GraphNode) => void
-  focusModeEnabled?: boolean
 }
 
 export function RadialMenu({
@@ -52,14 +48,12 @@ export function RadialMenu({
   position,
   onClose,
   onFindSimilar,
-  onToggleFocus,
   onStartPath,
   onAddToSelection,
   onEdit,
   onViewContent,
   onCopyId,
   onDelete,
-  focusModeEnabled = false,
 }: RadialMenuProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [hoveredItem, setHoveredItem] = useState<string | null>(null)
@@ -98,89 +92,94 @@ export function RadialMenu({
     onClose()
   }, [node.id, onCopyId, onClose])
 
-  // Menu items arranged in a circle (8 positions, starting from top)
-  const menuItems: RadialMenuItem[] = [
-    {
+  // Only include actions that are currently implemented to avoid dead-end menu entries.
+  const menuItems: RadialMenuItem[] = []
+
+  if (onFindSimilar) {
+    menuItems.push({
       id: 'find-similar',
       icon: <Search className="w-5 h-5" />,
       label: 'Find Similar',
       color: 'from-blue-500 to-cyan-500',
       action: () => {
-        onFindSimilar?.(node)
+        onFindSimilar(node)
         onClose()
       },
-    },
-    {
-      id: 'focus',
-      icon: <Sun className="w-5 h-5" />,
-      label: focusModeEnabled ? 'Exit Focus' : 'Focus Mode',
-      color: focusModeEnabled ? 'from-amber-500 to-yellow-500' : 'from-amber-400 to-orange-500',
-      action: () => {
-        onToggleFocus?.()
-        onClose()
-      },
-    },
-    {
+    })
+  }
+
+  if (onStartPath) {
+    menuItems.push({
       id: 'start-path',
       icon: <Route className="w-5 h-5" />,
       label: 'Find Path To...',
       color: 'from-cyan-500 to-teal-500',
       action: () => {
-        onStartPath?.(node.id)
+        onStartPath(node.id)
         onClose()
       },
-    },
-    {
+    })
+  }
+
+  if (onAddToSelection) {
+    menuItems.push({
       id: 'add-selection',
       icon: <Plus className="w-5 h-5" />,
       label: 'Add to Selection',
       color: 'from-green-500 to-emerald-500',
       action: () => {
-        onAddToSelection?.(node)
+        onAddToSelection(node)
         onClose()
       },
-      disabled: true, // TODO: Implement multi-selection
-    },
-    {
+    })
+  }
+
+  if (onViewContent) {
+    menuItems.push({
       id: 'view-content',
       icon: <FileText className="w-5 h-5" />,
       label: 'View Content',
       color: 'from-purple-500 to-violet-500',
       action: () => {
-        onViewContent?.(node)
+        onViewContent(node)
         onClose()
       },
-    },
-    {
+    })
+  }
+
+  if (onEdit) {
+    menuItems.push({
       id: 'edit',
       icon: <Pencil className="w-5 h-5" />,
       label: 'Edit Memory',
       color: 'from-indigo-500 to-blue-500',
       action: () => {
-        onEdit?.(node)
+        onEdit(node)
         onClose()
       },
-      disabled: true, // TODO: Implement edit
-    },
-    {
-      id: 'copy-id',
-      icon: <Copy className="w-5 h-5" />,
-      label: 'Copy ID',
-      color: 'from-slate-500 to-gray-500',
-      action: handleCopyId,
-    },
-    {
+    })
+  }
+
+  menuItems.push({
+    id: 'copy-id',
+    icon: <Copy className="w-5 h-5" />,
+    label: 'Copy ID',
+    color: 'from-slate-500 to-gray-500',
+    action: handleCopyId,
+  })
+
+  if (onDelete) {
+    menuItems.push({
       id: 'delete',
       icon: <Trash2 className="w-5 h-5" />,
       label: 'Delete',
       color: 'from-red-500 to-rose-500',
       action: () => {
-        onDelete?.(node)
+        onDelete(node)
         onClose()
       },
-      disabled: true, // TODO: Implement delete with confirmation
-    },
-  ]
+    })
+  }
 
   // Calculate position for each item (arranged in a circle)
   const radius = 80 // Distance from center
@@ -233,20 +232,20 @@ export function RadialMenu({
           return (
             <button
               key={item.id}
-              onClick={item.disabled ? undefined : item.action}
+              onClick={item.action}
               onMouseEnter={() => setHoveredItem(item.id)}
               onMouseLeave={() => setHoveredItem(null)}
-              disabled={item.disabled}
+              onFocus={() => setHoveredItem(item.id)}
+              onBlur={() => setHoveredItem(null)}
               className={`
                 absolute w-12 h-12 -translate-x-1/2 -translate-y-1/2
                 rounded-full
                 flex items-center justify-center
                 transition-all ease-out
-                ${item.disabled
-                  ? 'opacity-30 cursor-not-allowed bg-slate-800'
-                  : `bg-gradient-to-br ${item.color} shadow-lg cursor-pointer hover:shadow-xl`
-                }
-                ${isHovered && !item.disabled ? 'scale-125 z-20' : 'scale-100'}
+                bg-gradient-to-br ${item.color} shadow-lg cursor-pointer hover:shadow-xl
+                focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/90
+                focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900
+                ${isHovered ? 'scale-125 z-20' : 'scale-100'}
               `}
               style={{
                 left: isOpen ? pos.x : 0,
@@ -256,6 +255,7 @@ export function RadialMenu({
                 transitionDelay: isOpen ? `${delay}ms` : '0ms',
               }}
               title={item.label}
+              aria-label={item.label}
             >
               <div className="text-white">{item.icon}</div>
             </button>
